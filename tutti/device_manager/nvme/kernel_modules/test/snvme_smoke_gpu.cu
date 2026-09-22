@@ -81,6 +81,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <fcntl.h>
 #include <sched.h>
 #include <sys/ioctl.h>
@@ -729,6 +730,68 @@ static void run_one_round(int fd_dev,
         step_ok("round=%u Tier 2 (PRP1+PRP2, 8 KiB) x %u IOs, LBA [%"
                 PRIu64 "..%" PRIu64 "]",
                 round_idx, NR, LBA_BASE, LBA_BASE + 2u * (NR - 1) + 1);
+    }
+
+    /* ============================================================== */
+    /* Phase R.6b (added for verification): BULK GPU-direct transfer.   */
+    /* 64 KiB IOs (PRP1 + 15-entry PRP_List), SNVME_TEST_BULK_MIB MiB   */
+    /* written then read back and byte-verified on the GPU. Round 0 only*/
+    /* ============================================================== */
+    if (round_idx == 0 && getenv("SNVME_TEST_BULK_MIB")) {
+        const uint32_t nsid = 1;
+        /* SNVME_TEST_BULK_PAGES = 1 (4 KiB IO, PRP1 only) or 16 (64 KiB IO, PRP1+PRP_List) */
+        const unsigned pages = (getenv("SNVME_TEST_BULK_PAGES") && atoi(getenv("SNVME_TEST_BULK_PAGES")) == 1) ? 1 : 16;
+        const uint16_t nlb_zero_based = pages - 1;
+        const size_t   io_bytes = pages * info.block_size;      /* 64 KiB */
+        const uint64_t BULK_LBA = TEST_LBA_BASE + 0x1000000ULL; /* far from the tier windows */
+        const unsigned NR = getenv("SNVME_TEST_BULK_IOS") ? (unsigned)strtoul(getenv("SNVME_TEST_BULK_IOS"), NULL, 10)
+                          : (unsigned)(strtoul(getenv("SNVME_TEST_BULK_MIB"), NULL, 10) * 1024u * 1024u / io_bytes);
+        const uint64_t prp2_w = pages == 1 ? 0 : pdata.prp_list_w_ioaddr;
+        const uint64_t prp2_r = pages == 1 ? 0 : pdata.prp_list_r_ioaddr;
+        const uint8_t  pat = 0x5C;
+        queue_state& qw = rr.QS[0];
+        queue_state& qr = rr.QS[1];
+        char status_buf[64];
+        uint64_t ew[15], er[15];
+        for (unsigned k = 0; k < 15; k++) { ew[k] = wpage(k + 1); er[k] = rpage(k + 1); }
+        CUDA_OK(cudaMemcpy(pdata.prp_list_w_dev, ew, sizeof(ew), cudaMemcpyHostToDevice));
+        CUDA_OK(cudaMemcpy(pdata.prp_list_r_dev, er, sizeof(er), cudaMemcpyHostToDevice));
+        int* mismatch_um = nullptr;
+        CUDA_OK(cudaMallocManaged(&mismatch_um, sizeof(int)));
+        int threads = 256, blocks = (int)((io_bytes + threads - 1) / threads);
+        k_fill_pattern<<<blocks, threads>>>((uint8_t*)pdata.wbuf_dev, io_bytes, pat);
+        CUDA_OK(cudaDeviceSynchronize());
+        struct timespec t0, t1, t2; nvme_cqe cqe; uint16_t cid;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (unsigned i = 0; i < NR; i++) {
+            int rc = submit_and_poll(qw, NVME_OPC_WRITE, NVME_FLAG_PSDT_PRP, nsid, wpage(0),
+                                     prp2_w, BULK_LBA + (uint64_t)pages * i,
+                                     nlb_zero_based, &cqe, &cid);
+            if (rc) step_fail(-rc, "BULK Write %u", i);
+            if ((cqe.status >> 1) != 0) { format_status(cqe.status, status_buf, sizeof(status_buf));
+                                          step_fail(0, "BULK Write %u: NVMe %s", i, status_buf); }
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        for (unsigned i = 0; i < NR; i++) {
+            CUDA_OK(cudaMemset(pdata.rbuf_dev, 0, io_bytes));
+            int rc = submit_and_poll(qr, NVME_OPC_READ, NVME_FLAG_PSDT_PRP, nsid, rpage(0),
+                                     prp2_r, BULK_LBA + (uint64_t)pages * i,
+                                     nlb_zero_based, &cqe, &cid);
+            if (rc) step_fail(-rc, "BULK Read %u", i);
+            if ((cqe.status >> 1) != 0) { format_status(cqe.status, status_buf, sizeof(status_buf));
+                                          step_fail(0, "BULK Read %u: NVMe %s", i, status_buf); }
+            *mismatch_um = -1;
+            k_verify_pattern<<<blocks, threads>>>((const uint8_t*)pdata.rbuf_dev, io_bytes, pat, mismatch_um);
+            CUDA_OK(cudaDeviceSynchronize());
+            if (*mismatch_um != -1) step_fail(0, "BULK IO %u: byte %d mismatch", i, *mismatch_um);
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t2);
+        cudaFree(mismatch_um);
+        double mib = (double)NR * io_bytes / 1048576.0;
+        double ws = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+        double rs = (t2.tv_sec - t1.tv_sec) + (t2.tv_nsec - t1.tv_nsec) / 1e9;
+        step_ok("BULK GPU-direct: %u IOs x %u KiB = %.0f MiB written (%.1f MiB/s) + read back & byte-verified on GPU (%.1f MiB/s), 0 mismatches",
+                NR, (unsigned)(io_bytes / 1024), mib, mib / ws, mib / rs);
     }
 
     /* ============================================================== */
