@@ -120,7 +120,7 @@ ext = Pybind11Extension(
     "tutti_runtime._core",
     sources=["src/_core.cpp"],
     include_dirs=[TUTTI_INCLUDE, os.path.join(CUDA_ROOT, "include")] + CCCL_DIRS,
-    extra_compile_args=["-std=c++17", "-DTUTTI_USE_CUDA"],
+    extra_compile_args=["-std=c++17", "-DTUTTI_USE_CUDA", "-DTUTTI_COMPILED_ACCELERATOR_PROFILE=\"CUDA\"", "-DTUTTI_DEFAULT_ACCEL_ID=0"],  # must match libtutti_presets.a (header-only StorageRuntime -> ODR)
     extra_objects=STATIC_LIBS,
     libraries=(["nvm"] if os.path.isdir(LIBNVM_DIR) else []) + ["cudart"],
     library_dirs=RUNTIME_LIB_DIRS,
