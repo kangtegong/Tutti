@@ -409,6 +409,7 @@ class TuttiConnectorV1(KVConnectorBase_V1):
 
         # ---- scheduler 角色（T-113）----
         self._worker = None
+        self._live_requests: dict = {}
         self._min_retrieve_tokens = int(
             extra_config.get("min_retrieve_tokens", 0)
         )
@@ -422,6 +423,11 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         self._request_trackers: dict[str, RequestTracker] = {}
 
     # -------------------------------------------------- scheduler: 命中查询
+
+    def on_new_request(self, request) -> None:
+        """Keep the live Request so build_connector_meta can read new token ids
+        (vLLM >= 0.29 no longer ships them in CachedRequestData)."""
+        self._live_requests[request.request_id] = request
 
     def get_num_new_matched_tokens(
         self,
@@ -542,6 +548,7 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         for finished_req_id in scheduler_output.finished_req_ids:
             self._request_trackers.pop(finished_req_id, None)
             self.load_specs.pop(finished_req_id, None)
+            self._live_requests.pop(finished_req_id, None)
 
         # 处理新调度的请求：tracker 建档 + load/save 计划
         for request in scheduler_output.scheduled_new_reqs:
@@ -614,8 +621,17 @@ class TuttiConnectorV1(KVConnectorBase_V1):
                         base : base + num_new_tokens
                     ]
                 else:
-                    # PP-only 字段（new_token_ids），通常为空
-                    new_token_ids = cached_reqs.new_token_ids[i]
+                    # vLLM >= 0.29: new_token_ids is PP-only (empty otherwise) and
+                    # all_token_ids only covers requests skipped last step -> read the
+                    # live Request recorded by on_new_request() (same as LMCache does).
+                    live = self._live_requests.get(req_id)
+                    if live is not None:
+                        base = len(request_tracker.token_ids)
+                        new_token_ids = list(live.all_token_ids[base : base + num_new_tokens])
+                    elif i < len(cached_reqs.new_token_ids):
+                        new_token_ids = cached_reqs.new_token_ids[i]
+                    else:
+                        new_token_ids = []
                 request_tracker.update(new_token_ids, new_block_ids)
 
             req_meta = ReqMeta.from_request_tracker(
