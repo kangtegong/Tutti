@@ -4,6 +4,7 @@
 // Includes private headers to construct DataPaths + resolvers, returns
 // public types (StorageRuntime + RuntimeTelemetry).
 
+#include <cstdio>
 #include "tutti/presets/local_nvme.h"
 
 #include <tutti/storage_runtime.h>
@@ -55,7 +56,11 @@ RuntimeWithTelemetry make_local_nvme_runtime(const LocalNvmePreset& p) {
     comps.data_paths.push_back({"local-nvme-ext4", dp, DataPathConfig{"local_nvme"}});
 
     auto created = StorageRuntime::create({}, std::move(comps));
-    if (!created.ok()) return {};
+    if (!created.ok()) {
+        std::fprintf(stderr, "[tutti] make_*_nvme_runtime: StorageRuntime::create failed: %s\n",
+                     created.status().message().c_str());
+        return {};
+    }
 
     RuntimeWithTelemetry result;
     result.runtime = std::move(created).value();
@@ -101,7 +106,11 @@ RuntimeWithTelemetry make_striped_nvme_runtime(const StripedNvmePreset& p) {
                                  dp, DataPathConfig{"striped-nvme"}});
 
     auto created = StorageRuntime::create({}, std::move(comps));
-    if (!created.ok()) return {};
+    if (!created.ok()) {
+        std::fprintf(stderr, "[tutti] make_*_nvme_runtime: StorageRuntime::create failed: %s\n",
+                     created.status().message().c_str());
+        return {};
+    }
 
     RuntimeWithTelemetry result;
     result.runtime = std::move(created).value();
