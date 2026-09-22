@@ -189,7 +189,10 @@ class WorkerImpl:
             spec = req_meta.save_spec
             if spec is None or not spec.can_save or not spec.chunk_ids:
                 continue
-            state = self._stores.get(req_meta.req_id)
+            # One request can save several times (chunked prefill, decode crossing a
+            # chunk boundary) while earlier saves are still in flight -> key per save event.
+            store_key = (req_meta.req_id, spec.skip_leading_tokens)
+            state = self._stores.get(store_key)
             if state is None:
                 skip_chunk = spec.skip_leading_tokens // self._engine.chunk_tokens
                 n = len(spec.chunk_ids)
@@ -204,7 +207,7 @@ class WorkerImpl:
                         evicted=(),
                     )
                 )
-                self._stores[req_meta.req_id] = state
+                self._stores[store_key] = state
             if layer_idx <= state.issued:
                 continue  # 本层已提交（重复回调）
             self._issue_store_waves(state, layer_idx=layer_idx)
