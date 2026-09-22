@@ -651,9 +651,9 @@ int map_gpu_memory(struct map* map, struct list* list)
 
     map->n_addrs = peer_memory_pt_entries(gd->pages);
 
-    //printk("vaddr: %llx\n", (uint64_t) map->vaddr);
-//    for (j = 0; j < map->n_addrs; j++)
-//        printk("\tpaddr: %llx\n", (uint64_t) map->addrs[j]);
+    pr_info("snvme P2P: GPU vaddr=%llx n_pages=%lu nvme_dma[0]=%llx nvme_dma[last]=%llx\n",
+        (uint64_t) map->vaddr, map->n_addrs,
+        (uint64_t) map->addrs[0], (uint64_t) map->addrs[map->n_addrs - 1]);
 
     return 0;
 }
@@ -716,9 +716,9 @@ int map_gpu_ioqueue_memory(struct map* map)
 
     map->n_addrs = peer_memory_pt_entries(gd->pages);
 
-    //printk("vaddr: %llx\n", (uint64_t) map->vaddr);
-//    for (j = 0; j < map->n_addrs; j++)
-//        printk("\tpaddr: %llx\n", (uint64_t) map->addrs[j]);
+    pr_info("snvme P2P: GPU vaddr=%llx n_pages=%lu nvme_dma[0]=%llx nvme_dma[last]=%llx\n",
+        (uint64_t) map->vaddr, map->n_addrs,
+        (uint64_t) map->addrs[0], (uint64_t) map->addrs[map->n_addrs - 1]);
 
     return 0;
 }
