@@ -420,7 +420,10 @@ private:
     // EVENT: normal path -- cudaEventRecord on caller stream after kernel.
     // STREAM_QUERY: fallback when event record fails after launch --
     //   progress() uses cudaStreamQuery on the borrowed stream.
-    enum class CompletionMode { EVENT, STREAM_QUERY };
+    // HOST_RING: resident-service mode (TUTTI_RESIDENT_IO=1) -- the IO was
+    // posted to the resident kernel's pinned host ring; completion is
+    // host-visible (seq_done/result in the pinned slots), no event/stream.
+    enum class CompletionMode { EVENT, STREAM_QUERY, HOST_RING };
 
     struct OpEntry {
         OpState state = OpState::IN_FLIGHT;
@@ -443,6 +446,12 @@ private:
         void* event = nullptr;          // arena slot's pre-created cudaEvent_t
         void* stream = nullptr;         // borrowed cudaStream_t
         CompletionMode completion_mode = CompletionMode::EVENT;
+
+        // HOST_RING bookkeeping: (ring slot index, expected seq) per entry,
+        // in the same order as entry_lengths.
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> ring_posts;
+        // index into the service's pinned status array, per entry (same order)
+        std::vector<std::uint32_t> ring_status_idx;
 
         // PRP-list workspace (borrowed from arena's pre-allocated DMA-mapped pool).
         // prp_list_dma is the arena's shared DMA mapping; per-slot IOVAs
@@ -535,6 +544,18 @@ private:
 
     // Round 15 S4 test-only counters (see test_submit_call_count() above).
     std::uint64_t test_submit_call_count_ = 0;
+
+    // Resident I/O control service (TUTTI_RESIDENT_IO=1): a small persistent
+    // kernel services a pinned request ring so GPU-issued NVMe I/O keeps
+    // working while compute kernels occupy the GPU.  Lazily started on the
+    // first resident submit (GPU context is current there).
+    struct ResidentService;
+    std::unique_ptr<ResidentService> resident_;
+    bool resident_enabled_ = false;    // from env at construction
+    bool resident_started_ = false;    // first-submit lazy init done
+    bool ensure_resident_();
+    void aggregate_ring_status_(OpEntry& op);
+    int resident_copy_(void* dst, const void* src, std::size_t n);  // cudaError_t as int
     std::uint64_t test_kernel_launch_count_ = 0;
 
     // Queue group (created in initialize(), destroyed before ctrl free).

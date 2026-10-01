@@ -6,6 +6,7 @@
 #include "tutti/data_paths/local_nvme/io/nvme_queue_group.h"
 #include "tutti/data_paths/local_nvme/io/device_target.h"
 #include "tutti/data_paths/local_nvme/io/submit_one.cuh"
+#include "tutti/data_paths/local_nvme/io/resident_service.cuh"
 #include "tutti/data_paths/local_nvme/io/prp_builder.h"
 
 #include <tutti/cuda_like.h>
@@ -13,7 +14,10 @@
 #include <nvm_types.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <mutex>
 #include <cstdio>
 #include <cstring>
 #include <set>
@@ -22,6 +26,159 @@
 #include <thread>
 
 namespace tutti::data_paths::local_nvme {
+
+// -------------------------------------------------------------------------
+// Resident I/O control service (TUTTI_RESIDENT_IO=1).  See resident_service.cuh.
+// -------------------------------------------------------------------------
+
+struct LocalNvmeDataPath::ResidentService {
+    ResidentRing* ring = nullptr;      // pinned host memory
+    ResidentRing* ring_dev = nullptr;  // device alias of the same memory
+    // Completion statuses live in PINNED HOST memory, written directly by the
+    // resident kernel (status_out device alias): harvest is a plain host read,
+    // no CUDA API call (pageable-memcpy paths wedge while the kernel runs).
+    static constexpr std::uint32_t STATUS_RING = 65536;
+    EntryCompletionStatus* status_buf = nullptr;      // pinned host
+    EntryCompletionStatus* status_dev = nullptr;      // device alias
+    std::uint64_t status_counter = 0;                 // monotonic post index
+    cudaStream_t  stream = nullptr;    // the resident kernel lives here (eternal!)
+    cudaStream_t  copy_stream = nullptr; // ring-mode H2D copies (must NOT share the kernel's stream)
+    std::uint32_t num_slots = 0;
+    std::uint32_t cursor = 0;
+    std::mutex mu;
+    bool ok = false;
+
+    ~ResidentService() {
+        if (ring) ring->stop = 1;
+        if (stream) { cudaStreamSynchronize(stream); cudaStreamDestroy(stream); }
+        if (copy_stream) { cudaStreamSynchronize(copy_stream); cudaStreamDestroy(copy_stream); }
+        if (ring) cudaFreeHost(ring);
+        if (status_buf) cudaFreeHost(status_buf);
+    }
+};
+
+static std::uint32_t env_u32_(const char* name, std::uint32_t dflt) {
+    const char* v = std::getenv(name);
+    if (!v || !v[0]) return dflt;
+    return static_cast<std::uint32_t>(std::strtoul(v, nullptr, 10));
+}
+
+bool LocalNvmeDataPath::ensure_resident_() {
+    if (resident_started_) return resident_ && resident_->ok;
+    resident_started_ = true;
+    auto svc = std::make_unique<ResidentService>();
+    const std::uint32_t blocks  = env_u32_("TUTTI_RESIDENT_BLOCKS", 2);
+    const std::uint32_t threads = env_u32_("TUTTI_RESIDENT_THREADS", 64);
+    std::uint32_t slots = env_u32_("TUTTI_RESIDENT_SLOTS", 0);
+    if (slots == 0) slots = std::max<std::uint32_t>(1024, max_batch_entries_ * 2);
+    const std::uint32_t backoff = env_u32_("TUTTI_RESIDENT_BACKOFF_NS", 5000);
+
+    const std::size_t bytes = resident_ring_bytes(slots);
+    void* host = nullptr;
+    if (cudaHostAlloc(&host, bytes, cudaHostAllocMapped) != cudaSuccess) {
+        std::fprintf(stderr, "[tutti] resident io: cudaHostAlloc failed, falling back\n");
+        resident_enabled_ = false;
+        return false;
+    }
+    std::memset(host, 0, bytes);
+    svc->ring = static_cast<ResidentRing*>(host);
+    svc->ring->num_slots = slots;
+    svc->ring->cq_poll_budget = cq_poll_budget_;
+    svc->ring->backoff_ns = backoff;
+    void* dptr = nullptr;
+    if (cudaHostGetDevicePointer(&dptr, host, 0) != cudaSuccess) {
+        cudaFreeHost(host); svc->ring = nullptr;
+        resident_enabled_ = false;
+        return false;
+    }
+    svc->ring_dev = static_cast<ResidentRing*>(dptr);
+    {
+        void* sb = nullptr;
+        if (cudaHostAlloc(&sb, ResidentService::STATUS_RING * sizeof(EntryCompletionStatus),
+                          cudaHostAllocMapped) != cudaSuccess) {
+            cudaFreeHost(host); svc->ring = nullptr;
+            resident_enabled_ = false;
+            return false;
+        }
+        std::memset(sb, 0, ResidentService::STATUS_RING * sizeof(EntryCompletionStatus));
+        svc->status_buf = static_cast<EntryCompletionStatus*>(sb);
+        void* sdp = nullptr;
+        if (cudaHostGetDevicePointer(&sdp, sb, 0) != cudaSuccess) {
+            resident_enabled_ = false;
+            return false;
+        }
+        svc->status_dev = static_cast<EntryCompletionStatus*>(sdp);
+    }
+    svc->num_slots = slots;
+    int lo = 0, hi = 0;
+    cudaDeviceGetStreamPriorityRange(&lo, &hi);
+    if (cudaStreamCreateWithPriority(&svc->stream, cudaStreamNonBlocking, hi)
+        != cudaSuccess) {
+        resident_enabled_ = false;
+        return false;
+    }
+    if (cudaStreamCreateWithFlags(&svc->copy_stream, cudaStreamNonBlocking)
+        != cudaSuccess) {
+        resident_enabled_ = false;
+        return false;
+    }
+    const int lerr = launch_resident_service(svc->ring_dev, blocks, threads,
+                                             svc->stream);
+    if (lerr != 0) {
+        std::fprintf(stderr, "[tutti] resident io: kernel launch failed (%d)\n", lerr);
+        resident_enabled_ = false;
+        return false;
+    }
+    svc->ok = true;
+    resident_ = std::move(svc);
+    std::fprintf(stderr,
+        "[tutti] resident io service: %u blocks x %u threads, %u ring slots, "
+        "backoff %u ns (GPU-issued NVMe I/O coexists with compute)\n",
+        blocks, threads, slots, backoff);
+    return true;
+}
+
+int LocalNvmeDataPath::resident_copy_(void* dst, const void* src,
+                                      std::size_t n) {
+    // The legacy-stream sync cudaMemcpy was observed to stall indefinitely
+    // while the resident kernel runs; copy on the service's own non-blocking
+    // stream and synchronize only that stream instead.
+    cudaError_t ce = cudaMemcpyAsync(dst, src, n, cudaMemcpyHostToDevice,
+                                     resident_->copy_stream);
+    if (ce != cudaSuccess) return static_cast<int>(ce);
+    return static_cast<int>(cudaStreamSynchronize(resident_->copy_stream));
+}
+
+void LocalNvmeDataPath::aggregate_ring_status_(OpEntry& op) {
+    // HOST_RING harvest: statuses are in the service's pinned host array,
+    // written directly by the resident kernel. Plain host reads, zero CUDA.
+    std::uint64_t confirmed = 0;
+    bool any_failed = false;
+    std::string first_error;
+    for (std::size_t i = 0; i < op.ring_status_idx.size(); ++i) {
+        const EntryCompletionStatus& st =
+            resident_->status_buf[op.ring_status_idx[i]];
+        const std::uint32_t r = st.result;
+        if (r != 0) {
+            any_failed = true;
+            if (r == 2) op.has_timeout = true;
+            if (first_error.empty())
+                first_error = "entry " + std::to_string(i) + ": error " +
+                              std::to_string(r);
+        } else if (i < op.entry_lengths.size()) {
+            confirmed += op.entry_lengths[i];
+        }
+    }
+    if (any_failed) {
+        op.state = OpState::FAILED;
+        op.status = Status(StatusCode::DEVICE_ERROR, first_error);
+        op.bytes_transferred = 0;
+    } else {
+        op.state = OpState::COMPLETED;
+        op.status = Status::Ok();
+        op.bytes_transferred = confirmed ? confirmed : op.total_bytes;
+    }
+}
 
 // -------------------------------------------------------------------------
 // Construction / destruction
@@ -97,6 +254,10 @@ LocalNvmeDataPath::LocalNvmeDataPath(
       handle_cache_capacity_(handle_cache_capacity),
       handle_cache_l2_capacity_(handle_cache_l2_capacity),
       prp_cache_capacity_(prp_cache_capacity) {
+    {
+        const char* r = std::getenv("TUTTI_RESIDENT_IO");
+        resident_enabled_ = (r && r[0] == '1');
+    }
     caps_.name = "local_nvme";
     caps_.source_api_version = 1;
     caps_.supports_host_execution = false;
@@ -139,6 +300,7 @@ LocalNvmeDataPath::LocalNvmeDataPath(
 }
 
 LocalNvmeDataPath::~LocalNvmeDataPath() {
+    resident_.reset();   // stop the resident I/O kernel before any teardown
     if (!initialized_) return;
     DeviceGuard device_guard(static_cast<std::int32_t>(cuda_device_));
     if (!device_guard.ok()) return;
@@ -1034,9 +1196,11 @@ Result<DataPathMemory> LocalNvmeDataPath::register_memory_impl_(
     if (view.io_granularity > 0) {
         std::string err_msg;
         if (!build_prebuilt_descriptors_(reg, view.io_granularity, err_msg)) {
-            nvm_dma_unmap(dma);
-            return Result<DataPathMemory>::Failure(
-                Status(StatusCode::DEVICE_ERROR, err_msg));
+            // Non-fatal: fall back to the dynamic PRP path for this
+            // registration (prebuilt is an optimization).
+            std::fprintf(stderr, "[tutti] prebuilt descriptors unavailable: %s\n",
+                         err_msg.c_str());
+            reg.prebuilt.valid = false;
         }
     }
 
@@ -1611,7 +1775,7 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
     bool prp_all_from_cache = false;  // true if ALL PRP pages came from cache
 
     if (total_list_ios > 0) {
-        if (prp_cache_.enabled()) {
+        if (prp_cache_.enabled() && !resident_enabled_) {
             // Try PRP cache path: ONE locked batch resolves all LIST pages
             // (was: one cache mutex round-trip per entry).
             bool cache_ok = true;
@@ -1667,6 +1831,9 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
         }
 
         if (!prp_all_from_cache) {
+            if (resident_enabled_)
+                std::fprintf(stderr, "[tutti] RING submit: dynamic PRP fill x%u (prebuilt missed)\n",
+                             (unsigned)total_list_ios);
             // Arena path: H2D fill into arena's pre-allocated PRP pool.
             std::vector<std::uint64_t> h_page(page_size / sizeof(std::uint64_t), 0);
             std::uint32_t list_idx = 0;
@@ -1675,11 +1842,16 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
                 for (const auto& li : pr.list_infos) {
                     fill_prp_list_page(h_page.data(), pr.mreg->dma,
                                        li.start_page, li.pages_in_io, page_size);
-                    // ASYNC H2D on caller stream.
-                    ce = cudaMemcpyAsync(
-                        static_cast<char*>(prp_pages) + list_idx * page_size,
-                        h_page.data(), page_size, cudaMemcpyHostToDevice,
-                        ctx.stream);
+                    // ASYNC H2D on caller stream (resident mode: synchronous,
+                    // the resident kernel may consume the page immediately).
+                    ce = (resident_enabled_ && ensure_resident_())
+                        ? static_cast<cudaError_t>(resident_copy_(
+                              static_cast<char*>(prp_pages) + list_idx * page_size,
+                              h_page.data(), page_size))
+                        : cudaMemcpyAsync(
+                              static_cast<char*>(prp_pages) + list_idx * page_size,
+                              h_page.data(), page_size, cudaMemcpyHostToDevice,
+                              ctx.stream);
                     if (ce != cudaSuccess) {
                         arena_.release(lease.slot_index);
                         // Also release any PRP cache entries acquired.
@@ -1721,7 +1893,11 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
     // then fix up entry.prp_entry from nullptr sentinel to GPU pointer.
     if (!h_dynamic_descs.empty()) {
         const AddressDescriptor* d_desc_base = lease.d_desc_pool;
-        ce = cudaMemcpyAsync(const_cast<AddressDescriptor*>(d_desc_base),
+        ce = (resident_enabled_ && ensure_resident_())
+            ? static_cast<cudaError_t>(resident_copy_(const_cast<AddressDescriptor*>(d_desc_base),
+                         h_dynamic_descs.data(),
+                         h_dynamic_descs.size() * sizeof(AddressDescriptor)))
+            : cudaMemcpyAsync(const_cast<AddressDescriptor*>(d_desc_base),
                          h_dynamic_descs.data(),
                          h_dynamic_descs.size() * sizeof(AddressDescriptor),
                          cudaMemcpyHostToDevice, ctx.stream);
@@ -1742,6 +1918,135 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
                 ++desc_idx;
             }
         }
+    }
+
+    // ================================================================
+    // Resident-service path (TUTTI_RESIDENT_IO=1): post the entries to the
+    // resident kernel's pinned ring instead of launching a kernel.  All
+    // GPU-side inputs (descriptors, PRP pages) were copied SYNCHRONOUSLY
+    // above, so the resident kernel can consume them immediately.
+    // Completion is host-visible (HOST_RING) — no event, no stream fence.
+    // ================================================================
+    if (resident_enabled_ && ensure_resident_()) {
+        static std::atomic<std::uint64_t> ring_submits{0};
+        const std::uint64_t rs = ++ring_submits;
+        if (rs <= 3 || rs % 500 == 0)
+            std::fprintf(stderr, "[tutti] RING submit #%llu: entries=%u list_ios=%u dyn_descs=%zu\n",
+                         (unsigned long long)rs, (unsigned)total_entries,
+                         (unsigned)total_list_ios, h_dynamic_descs.size());
+        // Statuses go to the service's pinned host array (kernel writes them
+        // through the device alias); the submit path performs NO GPU API calls.
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> posts;
+        std::vector<std::uint32_t> status_idx;
+        posts.reserve(total_entries);
+        status_idx.reserve(total_entries);
+        bool post_ok = true;
+        {
+            std::lock_guard<std::mutex> lk(resident_->mu);
+            std::uint32_t ei = 0;
+            for (const auto& he : h_entries) {
+                bool placed = false;
+                const auto deadline = std::chrono::steady_clock::now() +
+                                      std::chrono::seconds(5);
+                while (!placed) {
+                    for (std::uint32_t t = 0; t < resident_->num_slots; ++t) {
+                        const std::uint32_t idx =
+                            (resident_->cursor + t) % resident_->num_slots;
+                        ResidentSlot& sl = resident_->ring->slots[idx];
+                        if (sl.seq_req == sl.seq_done) {
+                            const std::uint32_t sidx = (std::uint32_t)(
+                                resident_->status_counter++ % ResidentService::STATUS_RING);
+                            resident_->status_buf[sidx].result = 0;
+                            resident_->status_buf[sidx].nvme_status_dword3 = 0;
+                            status_idx.push_back(sidx);
+                            sl.entry = he;
+                            sl.status_out = resident_->status_dev + sidx;
+                            const std::uint32_t seq = sl.seq_req + 1;
+                            std::atomic_thread_fence(std::memory_order_release);
+                            sl.seq_req = seq;
+                            resident_->ring->post_count = resident_->ring->post_count + 1;
+                            resident_->cursor = (idx + 1) % resident_->num_slots;
+                            posts.emplace_back(idx, seq);
+                            placed = true;
+                            break;
+                        }
+                    }
+                    if (!placed) {
+                        if (std::chrono::steady_clock::now() > deadline) {
+                            post_ok = false;
+                            break;
+                        }
+                        std::this_thread::sleep_for(std::chrono::microseconds(50));
+                    }
+                }
+                ++ei;
+                if (!post_ok) break;
+            }
+        }
+        if (!post_ok) {
+            // Entries already posted WILL be executed by the resident kernel;
+            // we cannot recall them.  Mark the op failed-but-live so the ring
+            // slots are harvested normally.
+            std::fprintf(stderr, "[tutti] resident io: ring exhausted\n");
+        }
+        ++test_kernel_launch_count_;
+        std::uint64_t op_token = next_op_token_++;
+        OpEntry op;
+        op.state = OpState::IN_FLIGHT;
+        op.status = Status::Ok();
+        op.bytes_transferred = 0;
+        op.total_bytes = total_bytes;
+        op.d_entries = d_entries;      // unused in this mode, kept for release paths
+        op.d_status = d_status;
+        op.entry_count = total_entries;
+        op.entry_lengths = std::move(h_entry_lengths);
+        op.event = event;              // arena event, unused (not recorded)
+        op.stream = ctx.stream;
+        op.completion_mode = CompletionMode::HOST_RING;
+        op.ring_posts = std::move(posts);
+        op.ring_status_idx = std::move(status_idx);
+        op.arena_slot = lease.slot_index;
+        op.prp_list_dma = prp_dma;
+        op.prp_ioaddrs_base = prp_ioaddrs_base;
+        op.prp_pages_devptr = prp_pages;
+        op.prp_list_page_count = total_list_ios;
+        op.op_token = op_token;
+        op.op_generation = 1;
+        op.prp_cache_refs = std::move(prp_cache_refs);
+        for (const auto& ref : op.prp_cache_refs) {
+            prp_cache_.pin(ref.entry);
+        }
+        for (const auto& pr : pending) {
+            if (!pr.accepted) continue;
+            op.target_tokens.push_back(pr.target_token);
+            op.memory_tokens.push_back(pr.memory_token);
+            auto tit = targets_.find(pr.target_token);
+            if (tit != targets_.end() && tit->second.cache_entry != nullptr) {
+                handle_cache_.pin(tit->second.cache_entry);
+                op.handle_cache_refs.push_back(tit->second.cache_entry);
+            }
+        }
+        if (!post_ok) {
+            op.state = OpState::FAILED;
+            op.status = Status(StatusCode::RESOURCE_EXHAUSTED,
+                               "resident ring exhausted");
+        }
+        ops_[op_token] = std::move(op);
+        if (has_rejection) {
+            outcome.status = Status(first_rejected_code,
+                                    "partial commit: " + first_rejected_msg);
+        } else {
+            outcome.status = Status::Ok();
+        }
+        outcome.op = detail::SpiIdentityMint::mint<detail::DataPathOpTag>(
+            op_token, 1);
+        for (std::size_t i = 0; i < count; ++i) {
+            if (pending[i].accepted) {
+                outcome.initial_states[i].state = RequestState::ACCEPTED;
+                outcome.initial_states[i].status = Status::Ok();
+            }
+        }
+        return outcome;
     }
 
     // ASYNC H2D on caller stream: entries array is pageable host memory,
@@ -2028,7 +2333,22 @@ Result<ProgressResult> LocalNvmeDataPath::progress_impl_(ProgressBudget budget) 
         // Round 16 S7: spin on cudaEventQuery within the budget timeout
         // to avoid the 1ms condition-variable sleep in Runtime::wait().
         cudaError_t ce;
-        if (op.completion_mode == CompletionMode::EVENT) {
+        if (op.completion_mode == CompletionMode::HOST_RING) {
+            auto ring_done = [&]() {
+                for (const auto& pr2 : op.ring_posts) {
+                    const ResidentSlot& sl = resident_->ring->slots[pr2.first];
+                    // monotonic: the slot may already carry a LATER seq from a
+                    // reuse; done means seq_done has reached (or passed) ours.
+                    if (static_cast<std::int32_t>(sl.seq_done - pr2.second) < 0)
+                        return false;
+                }
+                return true;
+            };
+            ce = cudaErrorNotReady;
+            do {
+                if (ring_done()) { ce = cudaSuccess; break; }
+            } while (std::chrono::steady_clock::now() < deadline);
+        } else if (op.completion_mode == CompletionMode::EVENT) {
             ce = cudaErrorNotReady;
             while (ce == cudaErrorNotReady &&
                    std::chrono::steady_clock::now() < deadline) {
@@ -2378,6 +2698,10 @@ bool LocalNvmeDataPath::test_op_has_timeout(DataPathOp op) const {
 // -------------------------------------------------------------------------
 
 void LocalNvmeDataPath::aggregate_completion_status_(OpEntry& op) {
+    if (op.completion_mode == CompletionMode::HOST_RING && resident_) {
+        aggregate_ring_status_(op);
+        return;
+    }
     if (!op.d_status || op.entry_count == 0) {
         // No status array (shouldn't happen for real ops).
         op.state = OpState::COMPLETED;

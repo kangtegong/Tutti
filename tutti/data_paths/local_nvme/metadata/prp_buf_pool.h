@@ -72,6 +72,7 @@ public:
 private:
     struct Segment {
         nvm_dma_t* dma = nullptr;      // nvm_dma_map_data_host'd
+        void* vaddr = nullptr;         // cudaHostAlloc'd backing (snvme requires pinned pages)
         std::uint64_t capacity_pages = 0;  // total pages in this segment
         std::uint64_t used_pages = 0;     // pages already sub-allocated
     };

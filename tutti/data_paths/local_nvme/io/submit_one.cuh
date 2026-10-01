@@ -96,7 +96,7 @@ void launch_fill_pattern(void* buf, unsigned char val, std::uint64_t n,
 // =========================================================================
 // Device-only code below — compiled only by nvcc.
 // =========================================================================
-#if defined(__CUDACC__)
+#if defined(__CUDACC__) && !defined(TUTTI_SUBMIT_ONE_NO_KERNEL)
 
 namespace tutti::data_paths::local_nvme {
 

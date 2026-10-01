@@ -23,6 +23,7 @@ add_library(tutti_local_nvme_datapath
     io/nvme_queue_group.cu
     io/device_target.cu
     io/submit_one.cu
+    io/resident_service.cu
 )
 
 set_target_properties(tutti_local_nvme_datapath PROPERTIES

@@ -489,6 +489,7 @@ public:
             : ((view.expected_kind == MemoryKind::DEVICE ||
                 view.expected_kind == MemoryKind::MANAGED)
                ? config_.accel_id : -1);
+        entry.io_granularity = view.io_granularity;
         entry.inflight_count = 0;
         entry.data_path_registrations.clear();
         return MemoryHandle(runtime_id_, slot, gen);
@@ -1084,6 +1085,7 @@ private:
         MemoryOwnership ownership = MemoryOwnership::CALLER_OWNED;
         MemoryKind kind = MemoryKind::HOST;
         std::int32_t accel_id = -1;
+        std::uint64_t io_granularity = 0;  // forwarded to data-path registration (prebuilt descriptors)
         int inflight_count = 0;
         std::vector<DataPathMemoryRegistration> data_path_registrations;
     };
@@ -1445,6 +1447,7 @@ private:
             ? DataPathMemoryKind::DEVICE
             : DataPathMemoryKind::HOST;
         DataPathMemoryView view{memory.address, memory.size, memory.accel_id, kind};
+        view.io_granularity = memory.io_granularity;  // was silently dropped -> no prebuilt descriptors
         auto registration = call_data_path_result_<DataPathMemory>(
             *target.data_path,
             [&] {
