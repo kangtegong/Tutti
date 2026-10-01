@@ -22,23 +22,35 @@ void resident_service_kernel(ResidentRing* ring)
     // (measured: 4 KiB sync H2D stalling for minutes, stores at 0.3 GB/s).
     // Only thread 0 of each block reads the single post counter; the block
     // sweeps the slots only when it changed.
+    const std::uint64_t idle_exit = ring->idle_exit_ns;
     __shared__ std::uint32_t seen, cur, stopf;
-    if (TUTTI_THREAD_IDX_X == 0) { seen = 0; cur = 0; stopf = 0; }
+    __shared__ unsigned long long idle_ns;
+    if (TUTTI_THREAD_IDX_X == 0) {
+        seen = 0; cur = 0; stopf = 0; idle_ns = 0;
+        atomicAdd_system(const_cast<int*>(&ring->alive), 1);
+        __threadfence_system();
+    }
     __syncthreads();
 
     while (true) {
         if (TUTTI_THREAD_IDX_X == 0) {   // single reader: uniform view for the block
             cur = ring->post_count;
             stopf = (std::uint32_t)ring->stop;
+            if (idle_exit && idle_ns > idle_exit) stopf = 2;   // idle self-exit
         }
         __syncthreads();
-        if (stopf) return;               // uniform exit (shared flag)
+        if (stopf) {                     // uniform exit (shared flag)
+            if (TUTTI_THREAD_IDX_X == 0)
+                atomicAdd_system(const_cast<int*>(&ring->alive), -1);
+            return;
+        }
         if (cur == seen) {
             if (backoff) __nanosleep(backoff);
+            if (TUTTI_THREAD_IDX_X == 0) idle_ns += backoff ? backoff : 1000;
             __syncthreads();
             continue;
         }
-        if (TUTTI_THREAD_IDX_X == 0) seen = cur;
+        if (TUTTI_THREAD_IDX_X == 0) { seen = cur; idle_ns = 0; }
         __syncthreads();
         bool worked = false;
         for (std::uint32_t i = tid; i < ring->num_slots; i += stride) {

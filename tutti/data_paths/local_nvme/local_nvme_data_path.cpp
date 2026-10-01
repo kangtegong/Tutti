@@ -45,8 +45,17 @@ struct LocalNvmeDataPath::ResidentService {
     cudaStream_t  copy_stream = nullptr; // ring-mode H2D copies (must NOT share the kernel's stream)
     std::uint32_t num_slots = 0;
     std::uint32_t cursor = 0;
+    std::uint32_t blocks = 2, threads = 64;
     std::mutex mu;
     bool ok = false;
+
+    // (Re)launch the service kernel if it idled out. Caller holds mu.
+    void ensure_running() {
+        if (!ok || ring->alive > 0) return;
+        const int lerr = launch_resident_service(ring_dev, blocks, threads, stream);
+        if (lerr != 0)
+            std::fprintf(stderr, "[tutti] resident io: relaunch failed (%d)\n", lerr);
+    }
 
     ~ResidentService() {
         if (ring) ring->stop = 1;
@@ -85,6 +94,10 @@ bool LocalNvmeDataPath::ensure_resident_() {
     svc->ring->num_slots = slots;
     svc->ring->cq_poll_budget = cq_poll_budget_;
     svc->ring->backoff_ns = backoff;
+    svc->ring->alive = 0;
+    svc->ring->idle_exit_ns = env_u32_("TUTTI_RESIDENT_IDLE_EXIT_US", 20000) * 1000u;
+    svc->blocks = blocks;
+    svc->threads = threads;
     void* dptr = nullptr;
     if (cudaHostGetDevicePointer(&dptr, host, 0) != cudaSuccess) {
         cudaFreeHost(host); svc->ring = nullptr;
@@ -1943,6 +1956,7 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
         bool post_ok = true;
         {
             std::lock_guard<std::mutex> lk(resident_->mu);
+            resident_->ensure_running();
             std::uint32_t ei = 0;
             for (const auto& he : h_entries) {
                 bool placed = false;
@@ -1982,6 +1996,10 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
                 ++ei;
                 if (!post_ok) break;
             }
+        }
+        {
+            std::lock_guard<std::mutex> lk(resident_->mu);
+            resident_->ensure_running();   // kernel may have idled out mid-post
         }
         if (!post_ok) {
             // Entries already posted WILL be executed by the resident kernel;
@@ -2334,6 +2352,10 @@ Result<ProgressResult> LocalNvmeDataPath::progress_impl_(ProgressBudget budget) 
         // to avoid the 1ms condition-variable sleep in Runtime::wait().
         cudaError_t ce;
         if (op.completion_mode == CompletionMode::HOST_RING) {
+            if (resident_ && resident_->ring->alive == 0) {
+                std::lock_guard<std::mutex> lk(resident_->mu);
+                resident_->ensure_running();
+            }
             auto ring_done = [&]() {
                 for (const auto& pr2 : op.ring_posts) {
                     const ResidentSlot& sl = resident_->ring->slots[pr2.first];

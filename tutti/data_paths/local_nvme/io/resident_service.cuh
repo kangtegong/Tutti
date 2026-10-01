@@ -48,6 +48,12 @@ struct ResidentRing {
     volatile int   stop;
     volatile std::uint32_t post_count;  // host bumps AFTER each slot post: the kernel's
                                         // only idle-time PCIe read (1 thread per block)
+    // A kernel that never terminates deadlocks every device-wide sync on the
+    // host (torch.cuda.synchronize, pageable-memcpy internals, ...). The
+    // service therefore EXITS after idle_exit_ns without work; the host
+    // relaunches it on post when alive == 0.
+    volatile int   alive;               // active block count (atomicAdd_system)
+    std::uint32_t  idle_exit_ns;        // self-exit after this much idle time
     std::uint32_t  num_slots;
     std::uint32_t  cq_poll_budget;
     std::uint32_t  backoff_ns;          // idle-sweep nanosleep
