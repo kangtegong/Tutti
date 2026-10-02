@@ -245,3 +245,55 @@ class ChunkIndex:
         self.stored.clear()
         self.pinned.clear()
         self.pending_store.clear()
+
+
+# ---------------------------------------------------------------------------
+# kado_native backend: the same index implemented in Rust (kado/native/).
+# Interface-compatible, including read-only .stored / .pending_store views.
+try:  # pragma: no cover - exercised when the wheel is installed
+    import kado_native as _kn
+except ImportError:
+    _kn = None
+
+PyChunkIndex = ChunkIndex
+
+if _kn is not None:
+    import logging as _logging
+    _logging.getLogger("kado").info("chunk index: kado_native (Rust) backend active")
+
+    class _View:
+        def __init__(self, contains, length, get=None):
+            self._c, self._l, self._g = contains, length, get
+        def __contains__(self, k): return self._c(bytes(k))
+        def __len__(self): return self._l()
+        def get(self, k, default=None):
+            v = self._g(bytes(k)) if self._g is not None else None
+            return default if v is None else v
+
+    class ChunkIndex:  # noqa: F811 - native replacement
+        def __init__(self, paths, chunk_size: int = CHUNK_SIZE):
+            if isinstance(paths, int):
+                paths = [f"slot://{i}" for i in range(paths)]
+            self._n = _kn.ChunkIndex(list(paths), chunk_size)
+            self.stored = _View(self._n.stored_contains, self._n.stored_len, self._n.stored_get)
+            self.pending_store = _View(self._n.pending_contains, self._n.pending_len)
+            self.pinned = _View(lambda k: False, self._n.pinned_len)
+            self.free = _View(lambda k: False, self._n.free_len)
+        @property
+        def capacity(self): return self._n.capacity
+        @property
+        def chunk_size(self): return self._n.chunk_size
+        def lookup_prefix(self, token_ids): return self._n.lookup_prefix(list(token_ids))
+        def keys_and_last_parent(self, token_ids, start_chunk=0, parent=b""):
+            ks, lp = self._n.keys_and_last_parent(list(token_ids), start_chunk, bytes(parent))
+            return list(ks), lp
+        def keys_for_tokens(self, token_ids, start_chunk=0, parent=b""):
+            return list(self._n.keys_for_tokens(list(token_ids), start_chunk, bytes(parent)))
+        def allocate(self, keys):
+            r = self._n.allocate([bytes(k) for k in keys])
+            return None if r is None else (r[0], list(r[1]))
+        def complete_store(self, keys, success=True): self._n.complete_store([bytes(k) for k in keys], success)
+        def pin(self, keys): return self._n.pin([bytes(k) for k in keys])
+        def unpin(self, keys): self._n.unpin([bytes(k) for k in keys])
+        def touch(self, keys): self._n.touch([bytes(k) for k in keys])
+        def reset(self): self._n.reset()
