@@ -18,6 +18,8 @@ H_i 指纹整个前缀 [0, (i+1)×chunk)，将来 chunk 内部分命中直接用
 """
 
 import hashlib
+
+import numpy as np
 from collections import OrderedDict
 
 CHUNK_SIZE = 256  # 对齐 LMCache 默认 chunk_size；构造参数可覆盖
@@ -34,10 +36,11 @@ def hash_chunk(tokens: tuple[int, ...], parent: bytes = b"") -> bytes:
     """
     h = hashlib.blake2b(digest_size=16)
     h.update(parent)
-    for t in tokens:
-        b = str(t).encode("ascii")
-        h.update(len(b).to_bytes(4, "little"))
-        h.update(b)
+    # Fixed-width little-endian int64 encoding: unambiguous and one C call,
+    # instead of a per-token Python loop (dominant admit-path cost at 8k+
+    # token prompts: ~3% of EngineCore CPU in profiles). Changes the on-disk
+    # key format; stores are rebuilt per server bring-up.
+    h.update(np.asarray(tokens, dtype=np.int64).tobytes())
     return h.digest()
 
 
