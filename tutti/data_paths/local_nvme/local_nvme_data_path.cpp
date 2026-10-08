@@ -1283,14 +1283,23 @@ bool LocalNvmeDataPath::build_prebuilt_descriptors_(
     }
     const bool needs_prp_list = pages_per_io > 2;
 
-    // R19 S3b REQUIRED 2: fail-closed for MDTS > 128KiB.
-    // h_prp_slot has 32 entries (256B / 8B). pages_per_io - 1 entries
-    // are needed; if > 32, the slot overflows.
-    if (needs_prp_list && pages_per_io - 1 > 32) {
-        status_msg = "MDTS > 128KiB: pages_per_io=" +
-                     std::to_string(pages_per_io) +
-                     " exceeds 256B sub-page packing capacity (max 33 pages)";
-        return false;
+    // Sub-page PRP slot sizing: a slice needs pages_per_io - 1 list entries
+    // (8 B each).  The slot is the smallest power-of-two that holds them
+    // (min 256 B so the legacy 16-slots-per-page layout is unchanged for
+    // slices <= 128 KiB).  Power-of-two slots always pack evenly into the
+    // PRP page and keep every list qword-aligned within one page.
+    // Fail-closed only when one slice's list cannot fit a single PRP page
+    // (which initialize() already guards via prp_list_page_capacity_).
+    std::uint64_t prp_slot_bytes = 256;
+    if (needs_prp_list) {
+        const std::uint64_t need_bytes =
+            (pages_per_io - 1) * sizeof(std::uint64_t);
+        while (prp_slot_bytes < need_bytes) prp_slot_bytes <<= 1;
+        if (prp_slot_bytes > page_size) {
+            status_msg = "slice PRP list does not fit one PRP page: pages_per_io=" +
+                         std::to_string(pages_per_io);
+            return false;
+        }
     }
 
     // Stage 3: validate alignment (already checked 64KiB in register_memory)
@@ -1307,9 +1316,9 @@ bool LocalNvmeDataPath::build_prebuilt_descriptors_(
     //                     + (s % SLOTS_PER_PAGE) * PRP_SLOT_BYTES
     // The NVMe controller reads from this IOVA via PCIe DMA.
     //
-    // SLOTS_PER_PAGE and SLOT_BYTES are now dynamic (page_size-aware).
-    const std::uint64_t PRP_SLOT_BYTES = 256;
-    const std::uint64_t PRP_SLOTS_PER_PAGE = page_size / PRP_SLOT_BYTES;  // 16 for 4KiB
+    // SLOTS_PER_PAGE and SLOT_BYTES are dynamic (page_size- and MDTS-aware).
+    const std::uint64_t PRP_SLOT_BYTES = prp_slot_bytes;
+    const std::uint64_t PRP_SLOTS_PER_PAGE = page_size / PRP_SLOT_BYTES;  // 16 for 4KiB/256B
     PrpBufRef prp_buf_ref;
     std::uint64_t num_prp_pages = 0;
     if (needs_prp_list) {
@@ -1392,6 +1401,11 @@ bool LocalNvmeDataPath::build_prebuilt_descriptors_(
     reg.prebuilt.prp_buf_ref = prp_buf_ref;  // pool-managed; freed on shutdown
     reg.prebuilt.num_prp_pages = num_prp_pages;
     reg.prebuilt.valid = true;
+    std::fprintf(stderr,
+                 "[tutti] prebuilt descriptors: bytes_per_slice=%llu num_slices=%llu "
+                 "(effective_mdts=%llu, prp_slot=%lluB)\n",
+                 (unsigned long long)bytes_per_slice, (unsigned long long)num_slices,
+                 (unsigned long long)effective_mdts_bytes_, (unsigned long long)PRP_SLOT_BYTES);
     return true;
 }
 
