@@ -55,7 +55,9 @@ RuntimeWithTelemetry make_local_nvme_runtime(const LocalNvmePreset& p) {
     comps.resolvers.push_back({"file", resolver});
     comps.data_paths.push_back({"local-nvme-ext4", dp, DataPathConfig{"local_nvme"}});
 
-    auto created = StorageRuntime::create({}, std::move(comps));
+    RuntimeConfig rcfg;
+    rcfg.accel_id = p.gpu_id;   // runtime must carry the DataPath's GPU (TP: rank-local device)
+    auto created = StorageRuntime::create(rcfg, std::move(comps));
     if (!created.ok()) {
         std::fprintf(stderr, "[tutti] make_*_nvme_runtime: StorageRuntime::create failed: %s\n",
                      created.status().message().c_str());
@@ -105,7 +107,9 @@ RuntimeWithTelemetry make_striped_nvme_runtime(const StripedNvmePreset& p) {
     comps.data_paths.push_back({std::string(tutti::binding::striped_local_nvme::kRecommendedDataPathKey),
                                  dp, DataPathConfig{"striped-nvme"}});
 
-    auto created = StorageRuntime::create({}, std::move(comps));
+    RuntimeConfig rcfg;
+    rcfg.accel_id = p.gpu_id;   // runtime must carry the DataPath's GPU (TP: rank-local device)
+    auto created = StorageRuntime::create(rcfg, std::move(comps));
     if (!created.ok()) {
         std::fprintf(stderr, "[tutti] make_*_nvme_runtime: StorageRuntime::create failed: %s\n",
                      created.status().message().c_str());
