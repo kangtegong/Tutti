@@ -153,11 +153,18 @@ class RequestTracker:
         else:
             unfolded_block_ids = list(block_ids)
 
+        # vLLM's V2 model runner sends a request that resumes after a
+        # preemption as a new request, with its whole sequence (prompt +
+        # generated tokens) in prefill_token_ids. The hit lookup
+        # (get_num_new_matched_tokens) runs over that whole sequence, so the
+        # tracker - and the load plan built from it - must too; with the
+        # prompt alone, hit chunks past the prompt were never loaded.
+        token_ids = getattr(new_request, "prefill_token_ids", None)
+        if token_ids is None:
+            token_ids = new_request.prompt_token_ids
         return RequestTracker(
             req_id=new_request.req_id,
-            token_ids=list(
-                new_request.prompt_token_ids[:num_tokens_to_compute]
-            ),
+            token_ids=list(token_ids[:num_tokens_to_compute]),
             allocated_block_ids=unfolded_block_ids,
             num_saved_tokens=external_cached_tokens,
         )

@@ -189,6 +189,22 @@ def test_engine_config_default_chunk_tokens_injected():
 # ---------------------------------------------------------------- slot_mapping（legacy :390-469）
 
 
+def test_tracker_of_resumed_request_covers_generated_tokens():
+    """A request that resumes after a preemption reaches the connector as a new
+    request (vLLM's V2 model runner); its whole sequence (prompt + generated
+    tokens) is in prefill_token_ids. The hit lookup runs over that sequence, so
+    the tracker - the load plan - must cover it, not the prompt alone."""
+    prompt = list(range(5000, 5000 + 200))
+    generated = list(range(9000, 9000 + 70))
+    nr = make_new_request("r_resumed", prompt, [3, 7, 9])
+    nr.prefill_token_ids = prompt + generated
+    tracker = RequestTracker.from_new_request(nr, 270, 2 * CS)
+    assert tracker.token_ids == prompt + generated
+    # a request without prefill_token_ids (V1 runner, or a first admission) keeps the prompt
+    nr2 = make_new_request("r_new", prompt, [3, 7])
+    assert RequestTracker.from_new_request(nr2, 200, 0).token_ids == prompt
+
+
 def test_slot_mapping_values_written_out():
     """验收点 1：block_ids=[3,7]、block_size=128、200 token。
 
